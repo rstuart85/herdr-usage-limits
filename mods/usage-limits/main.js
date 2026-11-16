@@ -5,7 +5,8 @@
 // this mod never reads a token. Everything below main.js is pure and tested.
 import { View, div, image, svg } from "gpui-kit";
 import { HoverCard, h_flex, v_flex } from "gpui-base";
-import { exec, focused, theme, props, shared, setShared, appHome } from "herdr";
+import { readFile } from "fs/promises";
+import { exec, hc, focused, spaces, theme, props, shared, setShared, appHome } from "herdr";
 import { PROVIDERS } from "./providers/index.js";
 import { barModel, cardModel, chooseDensity, hasLimits, limitsSettled, panelOnEnter, wanted } from "./lib/view.js";
 import { effectivePrefs, inPanel, isOnBar, isShown, spendOnBar, toggleFolded, toggleOnBar, togglePanel, toggleProvider, toggleShowBars, toggleShowResetTime, toggleSpendOnBar, toggleWindow } from "./lib/prefs.js";
@@ -37,6 +38,22 @@ const PANEL_OPEN_DELAY = 350;       // ms, so passing over the bar doesn't flash
 const PANEL_CLOSE_DELAY = 300;      // ms, lets the pointer cross from the bar to the card
 
 const now = () => Math.floor(Date.now() / 1000);
+
+// Runs a helper where the agents are: `on` is a space's machine (WSL, ssh), null for this computer.
+// The mod's files aren't on another machine, so there the script's text is sent instead.
+// A Windows checkout can hold CRLF line ends, which sh doesn't take.
+// ponytail: a sent script has no files beside it, so Codex and OpenCode session and spend reads
+// (codex-session.py, opencode/*.sql) fail on another machine; copy helpers/ there if that matters.
+async function helper(name, args, on, timeout) {
+  const path = `${appHome()}/mods/${MOD}/${name}`;
+  const options = timeout ? { timeout } : {};
+  if (!on) return exec("sh", [path, ...args], options);
+  const script = (await readFile(path, "utf8")).replace(/\r\n/g, "\n");
+  // A login shell: herdr-core's own PATH can lack where the agents are installed (~/.local/bin).
+  return exec("sh", ["-lc", script, name, ...args], { ...options, on });
+}
+// The machine a terminal address ("machine/t7") names, null for this computer ("t7").
+const machineOf = (terminal) => (terminal.includes("/") ? terminal.split("/")[0] : null);
 
 // A provider's icon. A tinted one (a one-color glyph) is drawn in the given color, like text,
 // so it shows on a dark and a light theme alike; any other is the picture as it is.
@@ -108,9 +125,9 @@ export default class UsageLimits extends View {
       const prev = states()[p.id] ?? { report: null, lastGood: null, installed: null };
       const spend = p.kind === "spend";
       try {
-        const r = spend
-          ? await exec("sh", [`${appHome()}/mods/${MOD}/${p.helper}`], { timeout: SPEND_TIMEOUT })
-          : await exec("sh", [`${appHome()}/mods/${MOD}/${p.helper}`]);
+        // The limits of the account on the shown space's machine.
+        const on = spaces().find((s) => s.active)?.machine ?? null;
+        const r = await helper(p.helper, [], on, spend ? SPEND_TIMEOUT : 0);
         if (spend && r.code !== 0 && r.code !== 127) {
           // A failed spend helper prints nothing, which would parse as "0 tokens": say it failed.
           next = nextState(prev, errorReport(p.helper, `Couldn't count ${p.name} tokens`, now()), true);
@@ -156,14 +173,14 @@ export default class UsageLimits extends View {
       let choices = null;
       let manual = false;
       try {
-        const info = JSON.parse((await exec("hc", ["get", terminal])).stdout);
+        const info = JSON.parse((await hc(["get", terminal])).stdout);
         const app = AGENTS[info.status?.app];
         const pid = info.foreground?.pid;
         if (app && pid) {
           const binding = app === "codex" ? codexBinding(shared(KEY_BINDINGS), terminal, pid, shared("patchbay.chat.bindings"), shared("patchbay.sessions")?.boot) : null;
-          const args = [`${appHome()}/mods/${MOD}/helpers/session.sh`, app, String(pid)];
+          const args = [app, String(pid)];
           if (binding) args.push(binding.id, binding.identity);
-          const r = await exec("sh", args, { timeout: SESSION_TIMEOUT });
+          const r = await helper("helpers/session.sh", args, machineOf(terminal), SESSION_TIMEOUT);
           const result = sessionReadResult(r, app, binding, pid, (info.cwd ?? "").split("/").pop());
           next = result.session;
           choices = result.choices;
