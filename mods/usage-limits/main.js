@@ -6,7 +6,7 @@
 import { View, div, image, svg } from "gpui-kit";
 import { HoverCard, h_flex, v_flex } from "gpui-base";
 import { readFile } from "fs/promises";
-import { exec, hc, focused, spaces, theme, props, shared, setShared, appHome } from "herdr";
+import { exec, hc, run, layout, focused, spaces, theme, props, shared, setShared, appHome } from "herdr";
 import { PROVIDERS } from "./providers/index.js";
 import { barModel, cardModel, chooseDensity, hasLimits, limitsSettled, panelOnEnter, wanted } from "./lib/view.js";
 import { effectivePrefs, inPanel, isOnBar, isShown, spendOnBar, toggleFolded, toggleOnBar, togglePanel, toggleProvider, toggleShowBars, toggleShowResetTime, toggleSpendOnBar, toggleWindow } from "./lib/prefs.js";
@@ -27,6 +27,9 @@ const SPEND_TIMEOUT = 15 * 1000;   // ms, a spend helper is killed after this (p
 const SESSION_TIMEOUT = 15 * 1000; // ms, session helpers are bounded even if process inspection hangs
 const AGENTS = { "claude-code": "claude", codex: "codex", opencode: "opencode", pi: "pi" }; // Herdr's app name → session.sh
 const BAR_W = 30;
+const STACK_ROW = 20;                // a stacked row's height
+const STACK_LABEL_W = 40;           // its label column
+const STACK_PAD = 6;                // above and below the stacked rows
 const PANEL_W = 340;
 const PANEL_BAR_W = 110;
 const SESSION_BAR_W = 60;
@@ -52,6 +55,15 @@ async function helper(name, args, on, timeout) {
   // A login shell: herdr-core's own PATH can lack where the agents are installed (~/.local/bin).
   return exec("sh", ["-lc", script, name, ...args], { ...options, on });
 }
+// The layout node with this id.
+function find(node, id) {
+  if (node?.id === id) return node;
+  for (const child of node?.children ?? []) {
+    const found = find(child, id);
+    if (found) return found;
+  }
+  return null;
+}
 // The machine a terminal address ("machine/t7") names, null for this computer ("t7").
 const machineOf = (terminal) => (terminal.includes("/") ? terminal.split("/")[0] : null);
 
@@ -76,6 +88,18 @@ function usageBar(width, fill, tick, color, t) {
   return div().relative().w(width).h(4).rounded(2).bg(t.border).flex_none()
     .child(div().absolute().left(0).top(0).h(4).rounded(2).w(Math.round(width * fill)).bg(color))
     .when(tick != null, (b) => b.child(div().absolute().top(-2).left(Math.round(width * tick)).w(1).h(8).bg(t.foreground).opacity(0.75)));
+}
+
+// usageBar as wide as the room left in its row: the fill and the pace tick are shares of it.
+function stretchBar(fill, tick, color, t) {
+  const share = (n) => Math.min(1, Math.max(0, n));
+  return h_flex().relative().flex_1().min_w(20).h(4).rounded(2).bg(t.border)
+    .child(div().h(4).rounded(2).flex_basis(0).flex_grow(share(fill)).bg(color))
+    .child(div().flex_basis(0).flex_grow(1 - share(fill)))
+    .when(tick != null, (b) => b.child(h_flex().absolute().left(0).right(0).top(-2).h(8)
+      .child(div().flex_basis(0).flex_grow(share(tick)))
+      .child(div().w(1).h(8).flex_none().bg(t.foreground).opacity(0.75))
+      .child(div().flex_basis(0).flex_grow(1 - share(tick)))));
 }
 
 export default class UsageLimits extends View {
@@ -276,7 +300,59 @@ export default class UsageLimits extends View {
       .child(div().whitespace_nowrap().text_color(t.foreground).child(today));
   }
 
+  // Stacked (layout prop `stacked`): for a narrow column such as a sidebar. One limit per
+  // row, its bar as wide as the block allows; the hover panel is the same. With the prop
+  // `autoSize` (this block's id in the layout) the block is kept as tall as its rows.
+  renderStacked(cx) {
+    const t = theme();
+    const st = states();
+    const prefs = this.prefs();
+    const model = barModel(st, prefs, now());
+    const numbers = sessionOnBar(this.session?.data, prefs);
+    // A group without limits (still loading, or a spend provider) takes one row of text.
+    const rows = model.groups.flatMap((g) => (g.segments.length
+      ? g.segments.map((s, i) => ({ g, s, first: i === 0 }))
+      : [{ g, s: null, first: true }]));
+    // The widest number sets the least width of the column, so the bars line up: about 6 px a character.
+    const textW = Math.max(0, ...rows.map((r) => 6 * (r.s?.text.length ?? 0)));
+    const row = ({ g, s, first }, i) => h_flex().id(`ul-stack-${i}`).h(STACK_ROW).flex_none().gap(8).items_center()
+      .opacity(g.dim ? 0.55 : 1)
+      .child(div().w(13).flex_none().when(first, (e) => e.child(providerIcon(g.providerId, g.icon, t.foreground))))
+      .when(s == null, (e) => e.child(div().text_color(t.dim).child(g.spend != null ? `today ${g.spend}` : g.mark ?? "")))
+      .when(s != null, (e) => e
+        .child(div().w(STACK_LABEL_W).flex_none().truncate().text_size(10.5).text_color(t.dim).child(first && g.mark ? `${s.short} ${g.mark}` : s.short))
+        .child(stretchBar(s.fill, s.tick, levelColor(s.level, t), t))
+        .child(div().min_w(textW).flex_none().flex().justify_end().whitespace_nowrap().text_color(limitColor(s.level, s.text, t)).child(s.text)));
+    const content = v_flex().id("ul-content").w_full().on_hover((on, cx) => this.hover(on, cx));
+    if (numbers.length) {
+      content.child(h_flex().h(STACK_ROW).flex_none().gap(10).items_center().pl(21)
+        .children(numbers.map((n) => div().whitespace_nowrap().text_color(textColor(n.level, n.text, t)).child(n.text))));
+    }
+    if (model.empty) content.child(h_flex().h(STACK_ROW).flex_none().items_center().child(svg(`mods/${MOD}/icons/gauge.svg`).size(14)));
+    content.children(rows.map(row));
+    this.fitHeight((rows.length + (numbers.length ? 1 : 0) + (model.empty ? 1 : 0)) * STACK_ROW + 2 * STACK_PAD + 1);
+
+    const panel = cardModel(st, now(), PROVIDERS, prefs);
+    const session = inPanel(prefs, "session") ? sessionView(this.session?.data, this.session?.title) : null;
+    const empty = panel.empty && !session && !(inPanel(prefs, "session") && (this.sessionChoices || this.sessionManual));
+    if (empty) this.panel = "settings";
+    const body = this.panel === "settings" || empty ? this.settings(!empty, t) : this.limits(panel, session, t);
+    return v_flex().id("root").size_full().px(12).justify_center().overflow_hidden()
+      .bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8).text_color(t.muted)
+      .child(HoverCard.new("ul-panel").anchor("bottom_left").open_delay(PANEL_OPEN_DELAY).close_delay(PANEL_CLOSE_DELAY)
+        .trigger(content)
+        .content(body));
+  }
+
+  // The block is as tall as its rows, when the layout names it in `autoSize`.
+  fitHeight(px) {
+    const id = props()?.autoSize;
+    const node = id ? find(layout(), id) : null;
+    if (node && node.size?.px !== px) run("layout.resize", { id, px });
+  }
+
   renderBar(cx) {
+    if (props()?.stacked) return this.renderStacked(cx);
     const t = theme();
     const st = states();
     const prefs = this.prefs();
